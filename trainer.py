@@ -12,6 +12,12 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import resnet
 
+try:
+    import tensorboardX as tb
+except ImportError:
+    print("tensorboardX is not installed")
+    tb = None
+
 model_names = sorted(name for name in resnet.__dict__
     if name.islower() and not name.startswith("__")
                      and name.startswith("resnet")
@@ -52,13 +58,15 @@ parser.add_argument('--save-dir', dest='save_dir',
 parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
-best_prec1 = 0
 
 
-def main():
-    global args, best_prec1
-    args = parser.parse_args()
+def add_summary_value(writer, key, value, iteration):
+    if writer:
+        writer.add_scalar(key, value, iteration)
 
+def main(args):
+    global best_prec1
+    best_prec1 = 0
 
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
@@ -128,30 +136,29 @@ def main():
         return
 
     for epoch in range(args.start_epoch, args.epochs):
-
+        # learning rate
+        args.current_lr = optimizer.param_groups[0]['lr']
+        add_summary_value(tb_summary_writer, 'learning_rate', args.current_lr, epoch)
+        print('current lr {:.5e}'.format(args.current_lr))
         # train for one epoch
-        print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         train(train_loader, model, criterion, optimizer, epoch)
         lr_scheduler.step()
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        prec1 = validate(val_loader, model, criterion, epoch)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
 
+        dicti = {'epoch': epoch + 1,
+                 'state_dict': model.state_dict(),
+                 'prec1': prec1, }
+        if is_best:
+            print('The best precision is: {best_prec1:.3f}'.format(best_prec1=best_prec1))
+            save_checkpoint(dicti, filename=os.path.join(args.save_dir, 'model-best.th'))
         if epoch > 0 and epoch % args.save_every == 0:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
-
-    save_checkpoint({
-        'state_dict': model.state_dict(),
-        'best_prec1': best_prec1,
-    }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+            save_checkpoint(dicti, filename=os.path.join(args.save_dir, 'model.th'))
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
@@ -191,8 +198,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
         loss = loss.float()
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target)[0]
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -207,8 +214,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1))
 
+    add_summary_value(tb_summary_writer, 'Loss/train', losses.avg, epoch)
+    add_summary_value(tb_summary_writer, 'Top1/train', top1.avg, epoch)
 
-def validate(val_loader, model, criterion):
+
+def validate(val_loader, model, criterion, epoch=None):
     """
     Run evaluation
     """
@@ -222,8 +232,10 @@ def validate(val_loader, model, criterion):
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
         target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True).cuda()
-        target_var = torch.autograd.Variable(target, volatile=True)
+        # input_var = torch.autograd.Variable(input, volatile=True).cuda()
+        input_var = input.cuda()
+        # target_var = torch.autograd.Variable(target, volatile=True)
+        target_var = target
 
         if args.half:
             input_var = input_var.half()
@@ -237,8 +249,8 @@ def validate(val_loader, model, criterion):
 
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target)[0]
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -252,12 +264,16 @@ def validate(val_loader, model, criterion):
                       i, len(val_loader), batch_time=batch_time, loss=losses,
                       top1=top1))
 
+    if epoch is not None:
+        add_summary_value(tb_summary_writer, 'Loss/test', losses.avg, epoch)
+        add_summary_value(tb_summary_writer, 'Top1/test', top1.avg, epoch)
+
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
 
     return top1.avg
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
     """
     Save the training model
     """
@@ -298,4 +314,22 @@ def accuracy(output, target, topk=(1,)):
 
 
 if __name__ == '__main__':
-    main()
+    # ----for my local set----#
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+    os.environ['OMP_NUM_THREADS'] = '1'
+    seed = 123
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    global args
+    args = parser.parse_args()
+    args.id = 'resnet20'
+    args.arch = 'resnet20'
+    args.save_dir = os.path.join('Experiments', args.id)
+
+    global tb_summary_writer
+    tb_summary_writer = tb and tb.SummaryWriter(args.save_dir)
+
+    # ----for my local set----#
+
+    main(args)
