@@ -255,6 +255,59 @@ def test(net):
     print("Total layers", len(list(filter(lambda p: p.requires_grad and len(p.data.size())>1, net.parameters()))))
 
 
+class LinearCapsPro(nn.Module):
+    def __init__(self, opt, in_features, num_C):
+        super(LinearCapsPro, self).__init__()
+        self.in_features = in_features
+        self.num_C = num_C
+        self.weight = Parameter(torch.Tensor(self.num_C, in_features))
+
+        self.opt = opt
+        self.init = opt.cappro_init_method
+        self.cappro_pro_mul_w = opt.cappro_pro_mul_w
+        self.cappro_dis_mul_w = opt.cappro_dis_mul_w
+        self.cappro_method = opt.cappro_method
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.init == 'kaiming':
+            nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
+        elif self.init == 'xavier':
+            nn.init.xavier_normal_(self.weight)
+        elif self.init == 'orthogonal':
+            nn.init.orthogonal_(self.weight)
+
+    def forward(self, x):
+        wx = torch.matmul(x, torch.t(self.weight))          # batch*num_classes
+        w_len_pow2 = torch.t(self.weight.pow(2).sum(dim=1, keepdim=True))  # 1*num_classes
+        if self.cappro_method in ['pro', 'pro-dis']:
+            pro = wx                                                # batch*num_classes
+            if not self.cappro_pro_mul_w:
+                pro = pro / torch.sqrt(w_len_pow2)
+        else:
+            pro = 0
+
+        if self.cappro_method in ['dis', 'pro-dis']:
+            x_len_pow2 = x.pow(2).sum(dim=1, keepdim=True)      # batch*1
+            wx_pow2 = wx.pow(2)     # batch*num_classes
+
+            if self.training:
+                x_len_pow2 = x_len_pow2 * (1.0 - self.opt.drop_prob_output)
+
+            dis = torch.sqrt(F.relu(x_len_pow2 - wx_pow2 / w_len_pow2))         # batch*num_classes
+            dis = torch.sign(wx)*(dis - torch.sqrt(x_len_pow2))                 # batch*num_classes
+
+            if self.cappro_dis_mul_w:
+                dis = dis * torch.sqrt(w_len_pow2)
+
+        else:
+            dis = 0
+
+        return pro-dis
+
+
+
 if __name__ == "__main__":
     for net_name in __all__:
         if net_name.startswith('resnet'):
