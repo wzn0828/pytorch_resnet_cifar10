@@ -31,8 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+from misc import model_utils
+from torch.nn.parameter import Parameter
 
-from torch.autograd import Variable
 
 __all__ = ['ResNet', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet1202']
 
@@ -41,6 +42,56 @@ def _weights_init(m):
     print(classname)
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
         init.kaiming_normal_(m.weight)
+
+
+class HW_connection(nn.Module):
+    def __init__(self, planes, subtract_mean=False, trans_gate_bias=0, carry_gate_bias=0, normal=False, skip_sum_1=False, nonlinear=nn.Sigmoid()):
+        super(HW_connection, self).__init__()
+        self.normal = normal
+        self.skip_sum_1 = skip_sum_1
+        self.nonlinear = nonlinear
+        self.subtract_mean = subtract_mean
+        if self.subtract_mean:
+            self.bn = nn.BatchNorm2d(planes, affine=False)
+
+        self.transform_gate = nn.Sequential(nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1),
+                                            self.nonlinear)
+        self.transform_gate[0].bias.data.fill_(trans_gate_bias)
+        if not self.skip_sum_1:
+            self.carry_gate = nn.Sequential(
+                nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1),
+                self.nonlinear)
+            self.carry_gate[0].bias.data.fill_(carry_gate_bias)
+
+    def forward(self, input_1, input_2):
+        # both inputs' size maybe batch*planes*H*W
+        trans_gate = self.transform_gate(input_1)   # batch*planes*H*W
+        if self.skip_sum_1:
+            carry_gate = 1 - trans_gate
+        else:
+            carry_gate = self.carry_gate(input_1)       # batch*planes*H*W
+
+        if self.subtract_mean:
+            output = input_2 * trans_gate + input_1 * carry_gate
+            self.bn(output)
+            running_mean = self.bn.running_mean.unsqueeze(dim=1).unsqueeze(dim=2)
+            output = output - running_mean
+            if self.normal == True:
+                l2 = torch.stack([trans_gate, carry_gate], dim=4).norm(p=2, dim=4, keepdim=False)
+                output = output/l2
+            output += running_mean
+        else:
+            if self.normal == True:
+                l2 = torch.stack([trans_gate, carry_gate], dim=4).norm(p=2, dim=4, keepdim=False)
+                trans_gate = trans_gate/l2
+                carry_gate = carry_gate/l2
+            output = input_2 * trans_gate + input_1 * carry_gate  # batch*opt.rnn_size
+
+        trans_gate = trans_gate.mean()
+        carry_gate = carry_gate.mean()
+
+        return output, trans_gate, carry_gate
+
 
 class LambdaLayer(nn.Module):
     def __init__(self, lambd):
@@ -54,10 +105,13 @@ class LambdaLayer(nn.Module):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes, stride=1, option='A'):
+    def __init__(self, in_planes, planes, opt, skip, stride=1, option='A'):
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
+        if opt.pre_activation:
+            self.bn1 = nn.BatchNorm2d(in_planes)
+        else:
+            self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
 
@@ -75,36 +129,86 @@ class BasicBlock(nn.Module):
                      nn.BatchNorm2d(self.expansion * planes)
                 )
 
+        self.pre_activation = opt.pre_activation
+        self.skip = skip
+        if skip == 'HW':
+            self.HW_connection = HW_connection(planes=planes, trans_gate_bias=opt.skip_HW_trans_bias, carry_gate_bias=opt.skip_HW_carry_bias, normal=False)
+        elif skip == 'HW-normal':
+            self.HW_connection = HW_connection(planes=planes, trans_gate_bias=opt.skip_HW_trans_bias, carry_gate_bias=opt.skip_HW_carry_bias, normal=True)
+        elif skip == 'HW-normal-sub':
+            self.HW_connection = HW_connection(planes=planes, subtract_mean=True, trans_gate_bias=opt.skip_HW_trans_bias,
+                                               carry_gate_bias=opt.skip_HW_carry_bias, normal=True)
+
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
+        if self.pre_activation:
+            out = F.relu(self.bn1(x))
+            out = F.relu(self.bn2(self.conv1(out)))
+            out = self.conv2(out)
+        else:
+            out = F.relu(self.bn1(self.conv1(x)))
+            out = self.bn2(self.conv2(out))
+
+        input = self.shortcut(x)
+        if self.skip == 'RES':
+            out += input
+        elif self.skip == 'RES-l2':
+            out += input
+            out = out * (1.0 / (2 ** 0.5))
+        elif self.skip is not None and self.skip in ['HW', 'HW-normal', 'HW-normal-sub']:
+            out, trans_gate, carry_gate = self.HW_connection(input, out)
+            # print('carry_gate and trans_gate:', carry_gate.item(), trans_gate.item())
+
+        if not self.pre_activation:
+            out = F.relu(out)
+
         return out
 
 
 class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
+    def __init__(self, block, num_blocks, opt, num_classes=10):
         super(ResNet, self).__init__()
+        self.opt = opt
         self.in_planes = 16
+
+        # self.skip_connection = opt.skip_connection
+        self.skip_2_num = opt.skip_2_num
+        num_skip_2 = self._get_num_skip_2(self.skip_2_num, num_blocks)
 
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(16)
-        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], num_skip_2[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], num_skip_2[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], num_skip_2[2], stride=2)
         self.linear = nn.Linear(64, num_classes)
+
+        if opt.cappro:
+            del self.linear
+            self.linear = LinearCapsPro(opt, 64, num_classes)
 
         self.apply(_weights_init)
 
-    def _make_layer(self, block, planes, num_blocks, stride):
+    def _make_layer(self, block, planes, num_blocks, num_skip_2, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
+        for i in range(0, len(strides)):
+            if i < num_blocks-num_skip_2:
+                layers.append(block(self.in_planes, planes, self.opt, skip=self.opt.skip_connection_1, stride=strides[i]))
+            else:
+                layers.append(block(self.in_planes, planes, self.opt, skip=self.opt.skip_connection_2, stride=strides[i]))
             self.in_planes = planes * block.expansion
 
         return nn.Sequential(*layers)
+
+    def _get_num_skip_2(self, skip_2_num, num_blocks):
+
+        if skip_2_num <= num_blocks[2]:
+            return [0, 0, skip_2_num]
+        elif skip_2_num <= num_blocks[1] + num_blocks[2]:
+            return [0, skip_2_num - num_blocks[2], num_blocks[2]]
+        elif skip_2_num <= num_blocks[0] + num_blocks[1] + num_blocks[2]:
+            return [skip_2_num - num_blocks[2] - num_blocks[1], num_blocks[1], num_blocks[2]]
+        else:
+            return num_blocks
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
@@ -117,28 +221,28 @@ class ResNet(nn.Module):
         return out
 
 
-def resnet20():
-    return ResNet(BasicBlock, [3, 3, 3])
+def resnet20(opt):
+    return ResNet(BasicBlock, [3, 3, 3], opt)
 
 
-def resnet32():
-    return ResNet(BasicBlock, [5, 5, 5])
+def resnet32(opt):
+    return ResNet(BasicBlock, [5, 5, 5], opt)
 
 
-def resnet44():
-    return ResNet(BasicBlock, [7, 7, 7])
+def resnet44(opt):
+    return ResNet(BasicBlock, [7, 7, 7], opt)
 
 
-def resnet56():
-    return ResNet(BasicBlock, [9, 9, 9])
+def resnet56(opt):
+    return ResNet(BasicBlock, [9, 9, 9], opt)
 
 
-def resnet110():
-    return ResNet(BasicBlock, [18, 18, 18])
+def resnet110(opt):
+    return ResNet(BasicBlock, [18, 18, 18], opt)
 
 
-def resnet1202():
-    return ResNet(BasicBlock, [200, 200, 200])
+def resnet1202(opt):
+    return ResNet(BasicBlock, [200, 200, 200], opt)
 
 
 def test(net):
